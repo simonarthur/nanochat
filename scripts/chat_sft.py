@@ -69,12 +69,12 @@ parser.add_argument("--gsm8k-epochs", type=int, default=4, help="number of epoch
 args = parser.parse_args()
 user_config = vars(args).copy()
 # -----------------------------------------------------------------------------
-
+print0("🡺 Starting SFT...")
 # Compute init
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 master_process = ddp_rank == 0
-print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
+print0(f"chat_sft COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
 synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
 get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
 if device_type == "cuda":
@@ -212,7 +212,8 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
         nonlocal cursor, epoch
         while len(conv_buffer) < buffer_size:
             conversation = dataset[cursor]
-            ids, mask = tokenizer.render_conversation(conversation)
+            #ids, mask = tokenizer.render_conversation(conversation)
+            ids, mask = tokenizer.render_conversation(conversation, max_tokens=args.max_seq_len)
             conv_buffer.append((ids, mask))
             cursor += ddp_world_size
             if cursor >= dataset_size:
@@ -334,6 +335,7 @@ smooth_train_loss = 0 # EMA of training loss
 ema_beta = 0.9 # EMA decay factor
 total_training_time = 0 # total wall-clock time of training
 step = 0
+print0(f"Beginning SFT training loop...")
 while True:
     flops_so_far = num_flops_per_token * args.total_batch_size * step
 
@@ -373,13 +375,16 @@ while True:
             'GSM8K': 0.0, 'HumanEval': 0.0, 'SpellingBee': 0.0,
         }
         task_results = {}
+        current_task = 0
         for task_name in all_tasks:
+            print0(f"Running chatcore evaluation for {task_name} {current_task+1}/{len(all_tasks)}...")
             limit = args.chatcore_max_cat if task_name in categorical_tasks else args.chatcore_max_sample
             max_problems = None if limit < 0 else limit  # -1 means no limit
             acc = run_chat_eval(task_name, orig_model, tokenizer, engine,
                                 batch_size=args.device_batch_size, max_problems=max_problems)
             task_results[task_name] = acc
             print0(f"  {task_name}: {100*acc:.2f}%")
+            current_task += 1            
         # Compute ChatCORE metrics (mean centered accuracy, ranges from 0=random to 1=perfect)
         def centered_mean(tasks):
             return sum((task_results[t] - baseline_accuracies[t]) / (1.0 - baseline_accuracies[t]) for t in tasks) / len(tasks)
@@ -429,9 +434,17 @@ while True:
     # evaluate the gradient
     synchronize()
     t0 = time.time()
-    for micro_step in range(grad_accum_steps):
+    for micro_step in range(grad_accum_steps):    
         loss = model(x, y)
         train_loss = loss.detach() # for logging
+        # Check for loss NaN, log it if so.
+        if torch.isnan(train_loss):
+            # also check raw logits to localize NaN source                                                                                                                                                                                                                                                                                                                                       
+            with torch.no_grad():
+                logits = model(x)  # forward without targets returns logits                                                                                                                                                                                                                                                                                                                      
+                print0(f"[diag] step={step} logits_nan={torch.isnan(logits).any().item()} logits_inf={torch.isinf(logits).any().item()}")
+                print0(f"[diag] step={step} x range=[{x.min().item()}, {x.max().item()}] x unique={x.unique().numel()}")        
+            print0(f"!! Step {step:05d} | Loss is NaN | grad_accum_steps: {grad_accum_steps}")
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:
             scaler.scale(loss).backward()
@@ -465,6 +478,7 @@ while True:
     step += 1
 
     # logging
+    print0(f"smooth_train_loss calculation: {ema_beta} * {smooth_train_loss} + (1 - {ema_beta}) * {train_loss.item()} = {smooth_train_loss}")
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss.item() # EMA the training loss
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
     pct_done = 100 * progress
@@ -474,6 +488,7 @@ while True:
     if step > 10:
         total_training_time += dt # only count the time after the first 10 steps
     print0(f"step {step:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | epoch: {current_epoch} | total time: {total_training_time/60:.2f}m")
+    print0(f"debiased_smooth_loss calculation: {smooth_train_loss} / (1 - {ema_beta}**({step + 1})) = {debiased_smooth_loss}")
     if step % 10 == 0:
         wandb_run.log({
             "step": step,

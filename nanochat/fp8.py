@@ -132,8 +132,11 @@ class _Float8Matmul(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input_2d, weight):
         # Quantize both operands to e4m3 (higher precision format)
-        input_fp8, input_inv = _to_fp8(input_2d, torch.float8_e4m3fn)
-        weight_fp8, weight_inv = _to_fp8(weight, torch.float8_e4m3fn)
+        # input_fp8, input_inv = _to_fp8(input_2d, torch.float8_e4m3fn)
+        # weight_fp8, weight_inv = _to_fp8(weight, torch.float8_e4m3fn)
+        #3060 only supports e5m2
+        input_fp8, input_inv = _to_fp8(input_2d, torch.float8_e5m2)
+        weight_fp8, weight_inv = _to_fp8(weight, torch.float8_e5m2)        
         ctx.save_for_backward(input_fp8, input_inv, weight_fp8, weight_inv)
 
         # output = input @ weight.T

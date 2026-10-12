@@ -17,6 +17,7 @@ import gc
 import json
 import time
 import math
+import statistics
 import argparse
 from dataclasses import asdict
 from contextlib import contextmanager
@@ -330,7 +331,9 @@ if scaler is not None:
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
 train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
 build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
+print0(f"Base Train loadng data for first step...")
 x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
+print0(f"Base Train loadng data for first step done.")
 
 # -----------------------------------------------------------------------------
 # Calculate the number of iterations we will train for and set up the various schedulers
@@ -406,19 +409,50 @@ else:
 # Figure out the needed gradient accumulation micro-steps to reach the desired total batch size per step
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
 world_tokens_per_fwdbwd = tokens_per_fwdbwd * ddp_world_size # total tokens per iteration for all ranks
+print0(f"🍄 args.device_batch_size * args.max_seq_len: {args.device_batch_size:,} * {args.max_seq_len:,} ")
+print0(f"🍄 tokens_per_fwdbwd: {tokens_per_fwdbwd:,} ddp_world_size: {ddp_world_size:,}")
+print0(f"🍄 world_tokens_per_fwdbwd = Base Train Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
+print0(f"🍄 Base Train Total batch size {total_batch_size:,}")
+if total_batch_size % world_tokens_per_fwdbwd != 0:
+    print0(f"🛑 Base Train Total batch size {total_batch_size:,} is not evenly divisible by world_tokens_per_fwdbwd {world_tokens_per_fwdbwd:,}")
+    optimal_total_batch_size1 = total_batch_size // world_tokens_per_fwdbwd * world_tokens_per_fwdbwd
+    optimal_total_batch_size2 = (total_batch_size // world_tokens_per_fwdbwd + 1) * world_tokens_per_fwdbwd
+    print0(f"🛑 Try setting --total-batch-size= to a multiple of {world_tokens_per_fwdbwd:,}, e.g. {optimal_total_batch_size1} or {optimal_total_batch_size2}")
 assert total_batch_size % world_tokens_per_fwdbwd == 0
 grad_accum_steps = total_batch_size // world_tokens_per_fwdbwd
-print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_len} = {tokens_per_fwdbwd:,}")
-print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
-print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
+print0(f"Base Train Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_len} = {tokens_per_fwdbwd:,}")
+print0(f"Base Train Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
+
+# Speed accounting for the end-of-run speed report (see print_speed_report below)
+start_step = step
+step_times = {} # step -> dt of its training step (fwd/bwd/optimizer)
+disturbed_steps = set() # steps whose loop iteration also ran eval/sampling/checkpointing
+phase_time = {"eval": 0.0, "checkpoint": 0.0, "reporting": 0.0}
+phase_count = {"eval": 0, "checkpoint": 0}
+
+def phase_start():
+    synchronize()
+    return time.time()
+
+def phase_end(t_start, phase, step):
+    synchronize()
+    phase_time[phase] += time.time() - t_start
+    phase_count[phase] += 1
+    disturbed_steps.add(step)
+
+synchronize()
+loop_t0 = time.time()
 
 # Go!
 while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
     flops_so_far = num_flops_per_token * total_batch_size * step
+    print0(f"Base Train Flops so far: {flops_so_far:e}")
 
     # once in a while: evaluate the val bpb (all ranks participate)
     if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
+        print0(f"Base Train Starting evaluation step {step:05d}...")
+        t_phase = phase_start()
         model.eval()
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
@@ -434,12 +468,15 @@ while True:
             "val/bpb": val_bpb,
         })
         model.train()
+        phase_end(t_phase, "eval", step)
 
     # once in a while: estimate the CORE metric (all ranks participate)
     # use the original uncompiled model because the inputs keep changing shape
     # disable FP8 for evaluation to use BF16 for more consistent/accurate results
     results = {}
     if args.core_metric_every > 0 and (last_step or (step > 0 and step % args.core_metric_every == 0)):
+        print0(f"Base Train Starting CORE metric evaluation step {step:05d}...")
+        t_phase = phase_start()
         model.eval()
         with disable_fp8(orig_model):
             results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
@@ -451,10 +488,13 @@ while True:
             "centered_results": results["centered_results"],
         })
         model.train()
+        phase_end(t_phase, "eval", step)
 
     # once in a while: sample from the model (only on master process)
     # use the original uncompiled model because the inputs keep changing shape
     if args.sample_every > 0 and master_process and (last_step or (step > 0 and step % args.sample_every == 0)):
+        print0(f"Base Train Starting sampling step {step:05d}...")
+        t_phase = phase_start()
         model.eval()
         prompts = [
             "The capital of France is",
@@ -472,9 +512,12 @@ while True:
                 sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
             print0(tokenizer.decode(sample[0]))
         model.train()
+        phase_end(t_phase, "eval", step)
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
     if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
+        print0(f"Base Train Starting checkpoint save step {step:05d}...")
+        t_phase = phase_start()
         save_checkpoint(
             checkpoint_dir,
             step,
@@ -497,6 +540,7 @@ while True:
             },
             rank=ddp_rank,
         )
+        phase_end(t_phase, "checkpoint", step)
 
     # termination conditions (TODO: possibly also add loss explosions etc.)
     if last_step:
@@ -507,6 +551,7 @@ while True:
     # evaluate the gradient
     synchronize()
     t0 = time.time()
+    print0(f"Base Train Starting training step {step:05d}...")
     for micro_step in range(grad_accum_steps):
         loss = model(x, y)
         train_loss = loss.detach() # for logging
@@ -515,7 +560,10 @@ while True:
             scaler.scale(loss).backward()
         else:
             loss.backward()
+        #print0(f"Base Train preloading data for next step at {step:05d}...")
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+        #print0(f"Base Train preloading data for next step at {step:05d} done.")
+    print0(f"Base Train Finished training step {step:05d}...")
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
@@ -542,6 +590,7 @@ while True:
     synchronize()
     t1 = time.time()
     dt = t1 - t0
+    step_times[step] = dt
     # -------------------------------------------------------------------------
 
     # logging (CPU action only)
@@ -550,6 +599,7 @@ while True:
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
     pct_done = 100 * step / num_iterations
     tok_per_sec = int(total_batch_size / dt)
+    steps_per_sec = 1 / dt
     flops_per_sec = num_flops_per_token * total_batch_size / dt
     mfu = 100 * flops_per_sec / (gpu_peak_flops * ddp_world_size)
     if step > 10:
@@ -564,7 +614,7 @@ while True:
     else:
         eta_str = ""
     epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | steps/sec: {steps_per_sec:.3f} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     if step % 100 == 0:
         log_data = {
             "step": step,
@@ -578,6 +628,7 @@ while True:
             "train/epoch": epoch,
         }
         wandb_run.log(log_data)
+    phase_time["reporting"] += time.time() - t1
 
     # state update
     first_step_of_run = (step == 0) or (resuming and step == args.resume_from_step)
@@ -592,6 +643,55 @@ while True:
         gc.disable() # nuclear intervention here: disable GC entirely except:
     elif step % 5000 == 0: # every 5000 steps...
         gc.collect() # manually collect, just to be safe for very, very long runs
+
+synchronize()
+loop_wall_time = time.time() - loop_t0
+
+def print_speed_report():
+    if not step_times:
+        return
+    first, last = min(step_times), max(step_times)
+    fmt_sps = lambda r: f"{r:.2f}" if r >= 1 else f"{r:.3f}"
+    lines = [f"speed over steps {first}-{last}:"]
+    lines.append(f"  whole loop, wall clock (incl. compile, eval, reporting): {fmt_sps(len(step_times) / loop_wall_time)} steps/s over {loop_wall_time:.1f} s")
+    # first step includes torch.compile, the next 9 are warmup
+    line = f"  step {first} (compile): {step_times[first]:.2f} s"
+    warmup = [step_times[s] for s in range(first + 1, min(first + 10, last + 1))]
+    if warmup:
+        line += f"   steps {first + 1}-{first + len(warmup)} (warmup): mean {1000 * statistics.mean(warmup):.1f} ms/step"
+    lines.append(line)
+    # steady state: everything after warmup, minus steps that shared an iteration with eval/sampling/checkpointing
+    steady = {s: dt for s, dt in step_times.items() if s >= first + 10 and s not in disturbed_steps}
+    if steady:
+        dts = sorted(steady.values())
+        sps = len(dts) / sum(dts)
+        lines.append(f"  steady state (steps {first + 10}-{last}, {len(dts)} steps without eval/sampling/checkpoint): {fmt_sps(sps)} steps/s = {int(sps * total_batch_size):,} tokens/s")
+        median = statistics.median(dts)
+        deciles = statistics.quantiles(dts, n=10) if len(dts) >= 2 else [dts[0]]
+        p10, p90 = deciles[0], deciles[-1]
+        lines.append(f"    per-step: median {fmt_sps(1 / median)} steps/s ({1000 * median:.2f} ms)   slowest 10% below {fmt_sps(1 / p90)} steps/s   fastest 10% above {fmt_sps(1 / p10)} steps/s   range {1000 * dts[0]:.2f}-{1000 * dts[-1]:.2f} ms")
+        # split the run into at most ~6 segments of a "nice" size (1, 2 or 5 x 10^k steps)
+        raw = (last + 1) / 6
+        mag = 10 ** math.floor(math.log10(raw))
+        seg = next(m * mag for m in (1, 2, 5, 10) if m * mag >= raw)
+        segments = []
+        for seg_start in range(0, last + 1, seg):
+            seg_dts = [dt for s, dt in steady.items() if seg_start <= s < seg_start + seg]
+            if seg_dts:
+                segments.append(f"{seg_start}-{min(seg_start + seg - 1, last)}: {fmt_sps(len(seg_dts) / sum(seg_dts))}")
+        lines.append("    steps/s by segment: " + "   ".join(segments))
+    # where the wall clock went
+    train_time = sum(step_times.values())
+    pct = lambda t: 100 * t / loop_wall_time
+    lines.append(
+        f"  time budget: training {train_time:.1f} s ({pct(train_time):.1f}%)"
+        f"   eval {phase_time['eval']:.1f} s over {phase_count['eval']} evals ({pct(phase_time['eval']):.1f}%)"
+        f"   checkpointing {phase_time['checkpoint']:.1f} s over {phase_count['checkpoint']} saves ({pct(phase_time['checkpoint']):.1f}%)"
+        f"   reporting {phase_time['reporting']:.1f} s ({pct(phase_time['reporting']):.1f}%)"
+    )
+    print0("\n".join(lines))
+
+print_speed_report()
 
 # print a few more stats
 print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")

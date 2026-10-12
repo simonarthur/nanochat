@@ -72,7 +72,10 @@ def get_base_dir():
     if os.environ.get("NANOCHAT_BASE_DIR"):
         nanochat_dir = os.environ.get("NANOCHAT_BASE_DIR")
     else:
-        home_dir = os.path.expanduser("~")
+        if os.environ.get("NANOCHAT_HOME_DIR"):
+            home_dir = os.environ.get("NANOCHAT_HOME_DIR")
+        else:
+            home_dir = os.path.expanduser("~")
         cache_dir = os.path.join(home_dir, ".cache")
         nanochat_dir = os.path.join(cache_dir, "nanochat")
     os.makedirs(nanochat_dir, exist_ok=True)
@@ -263,6 +266,8 @@ def get_peak_flops(device_name: str) -> float:
         # Consumer RTX
         (["5090"], 209.5e12),
         (["4090"], 165.2e12),
+        (["3060", "ti"], 51e12),
+        (["3060"], 25.4e12),
         (["3090"], 71e12),
     )
     for patterns, flops in _PEAK_FLOPS_TABLE:

@@ -42,10 +42,12 @@ python -m scripts.base_train \
     --sample-every=100 \
     --num-iterations=5000 \
     --run=$WANDB_RUN
+echo "🟢 Base Train Complete. Evaluating base model..."
 python -m scripts.base_eval --device-batch-size=1 --split-tokens=16384 --max-per-task=16
-
+echo "🟢 Base Eval Complete. Downloading identity conversations..."
 # SFT (~10 minutes on my MacBook Pro M3 Max)
 curl -L -o $NANOCHAT_BASE_DIR/identity_conversations.jsonl https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl
+echo "🟢 Identity conversations downloaded. Starting SFT..."
 python -m scripts.chat_sft \
     --max-seq-len=512 \
     --device-batch-size=32 \
